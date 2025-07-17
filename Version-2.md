@@ -312,4 +312,280 @@ func main() {
    * เซ็ต ENV: `DATABASE_URL`, `JWT_SECRET`
    * รัน Server และคอมไพล์ Agent กระจายไปตามเครื่อง
 
-ด้วยโครงสร้างนี้จะขยายฟีเจอร์ (เช่น เก็บประวัติสเปค, กราฟย้อนหลัง, เพิ่มโมดูลทำ heartbeat) ได้ง่าย และแยกความรับผิดชอบระหว่าง Server กับ Agent อย่างชัดเจนครับ!
+
+===
+
+ถ้าต้องการเก็บข้อมูลสเปคที่ละเอียดขึ้น เช่น หลายดิสก์ หลาย NIC เราจะเพิ่มตารางในฐานข้อมูลและปรับ API/โค้ดดังนี้
+
+---
+
+## 1. ปรับฐานข้อมูล (PostgreSQL)
+
+```sql
+-- 1.1 ตาราง specs ยังคงเหมือนเดิม (เก็บข้อมูล CPU, RAM ฯลฯ และ timestamp)
+-- 1.2 เพิ่มตาราง disk_partitions
+CREATE TABLE disk_partitions (
+  id            SERIAL PRIMARY KEY,
+  spec_id       INTEGER NOT NULL
+                   REFERENCES specs(id) ON DELETE CASCADE,
+  mountpoint    TEXT    NOT NULL,
+  fs_type       TEXT,
+  total_bytes   BIGINT  NOT NULL,
+  used_bytes    BIGINT  NOT NULL
+);
+
+-- 1.3 เพิ่มตาราง network_interfaces
+CREATE TABLE network_interfaces (
+  id             SERIAL PRIMARY KEY,
+  spec_id        INTEGER NOT NULL
+                    REFERENCES specs(id) ON DELETE CASCADE,
+  name           TEXT    NOT NULL,
+  mac_address    TEXT    NOT NULL,
+  ip_addresses   TEXT[]  NOT NULL  -- เก็บเป็น array ของ string
+);
+```
+
+---
+
+## 2. ปรับ API
+
+### 2.1 ขอข้อมูลจาก Agent (`POST /api/v1/specs`)
+
+```jsonc
+{
+  "cpu_model":   "Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz",
+  "cpu_cores":   8,
+  "ram_total":   17179869184,
+  "disks": [
+    {
+      "mountpoint":  "/",
+      "fs_type":     "ext4",
+      "total_bytes": 256000000000,
+      "used_bytes":  64000000000
+    },
+    {
+      "mountpoint":  "/data",
+      "fs_type":     "xfs",
+      "total_bytes": 512000000000,
+      "used_bytes":  128000000000
+    }
+  ],
+  "networks": [
+    {
+      "name":         "eth0",
+      "mac_address":  "00:1A:2B:3C:4D:5E",
+      "ip_addresses": ["192.168.1.10","fe80::1a2b:3cff:fe4d:5e6f"]
+    },
+    {
+      "name":         "wlan0",
+      "mac_address":  "00:1A:2B:3C:4D:5F",
+      "ip_addresses": ["192.168.1.11"]
+    }
+  ]
+}
+```
+
+---
+
+## 3. ฝั่ง Server (Go)
+
+### 3.1 Structs
+
+```go
+// internal/api/types.go
+type DiskPartitionInput struct {
+  Mountpoint string `json:"mountpoint"`
+  FSType     string `json:"fs_type"`
+  TotalBytes uint64 `json:"total_bytes"`
+  UsedBytes  uint64 `json:"used_bytes"`
+}
+
+type NetworkInterfaceInput struct {
+  Name        string   `json:"name"`
+  MACAddress  string   `json:"mac_address"`
+  IPAddresses []string `json:"ip_addresses"`
+}
+
+type SpecInput struct {
+  CPUModel   string                   `json:"cpu_model"`
+  CPUCores   int                      `json:"cpu_cores"`
+  RAMTotal   uint64                   `json:"ram_total"`
+  Disks      []DiskPartitionInput     `json:"disks"`
+  Networks   []NetworkInterfaceInput  `json:"networks"`
+}
+```
+
+### 3.2 Handler ปรับให้รับ array
+
+```go
+// internal/api/specs.go
+func PostSpecs(w http.ResponseWriter, r *http.Request) {
+  deviceID := r.Context().Value("device_id").(int)
+  var in SpecInput
+  if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+    http.Error(w, "Bad Request", http.StatusBadRequest)
+    return
+  }
+  // เรียก repository บันทึก
+  if err := repository.SaveSpecWithDetails(deviceID, in); err != nil {
+    http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+    return
+  }
+  w.WriteHeader(http.StatusCreated)
+}
+```
+
+### 3.3 Repository (crud)
+
+```go
+// internal/repository/spec.go
+func SaveSpecWithDetails(deviceID int, in api.SpecInput) error {
+  // 1) บันทึก specs หลัก
+  var specID int
+  err := db.QueryRow(`
+    INSERT INTO specs (device_id,cpu_model,cpu_cores,ram_total)
+    VALUES ($1,$2,$3,$4) RETURNING id`,
+    deviceID, in.CPUModel, in.CPUCores, in.RAMTotal,
+  ).Scan(&specID)
+  if err != nil {
+    return err
+  }
+  // 2) บันทึกแต่ละ disk
+  for _, d := range in.Disks {
+    if _, err := db.Exec(`
+      INSERT INTO disk_partitions(spec_id,mountpoint,fs_type,total_bytes,used_bytes)
+      VALUES($1,$2,$3,$4,$5)`,
+      specID, d.Mountpoint, d.FSType, d.TotalBytes, d.UsedBytes,
+    ); err != nil {
+      return err
+    }
+  }
+  // 3) บันทึกแต่ละ network
+  for _, n := range in.Networks {
+    if _, err := db.Exec(`
+      INSERT INTO network_interfaces(spec_id,name,mac_address,ip_addresses)
+      VALUES($1,$2,$3,$4)`,
+      specID, n.Name, n.MACAddress, pq.Array(n.IPAddresses),
+    ); err != nil {
+      return err
+    }
+  }
+  return nil
+}
+```
+
+> ใช้ `github.com/lib/pq` เพื่อรับ/ส่ง `TEXT[]`
+
+---
+
+## 4. ฝั่ง Agent (Go CLI)
+
+### 4.1 ปรับ Struct & รวบรวมข้อมูล
+
+```go
+// agent/main.go
+type DiskPartition struct {
+  Mountpoint string `json:"mountpoint"`
+  FSType     string `json:"fs_type"`
+  TotalBytes uint64 `json:"total_bytes"`
+  UsedBytes  uint64 `json:"used_bytes"`
+}
+
+type NetworkInterface struct {
+  Name        string   `json:"name"`
+  MACAddress  string   `json:"mac_address"`
+  IPAddresses []string `json:"ip_addresses"`
+}
+
+type Spec struct {
+  CPUModel string             `json:"cpu_model"`
+  CPUCores int                `json:"cpu_cores"`
+  RAMTotal uint64             `json:"ram_total"`
+  Disks    []DiskPartition    `json:"disks"`
+  Networks []NetworkInterface `json:"networks"`
+}
+
+func collectSpec() Spec {
+  // CPU & RAM
+  cpuInfo, _ := cpu.Info()
+  cores, _  := cpu.Counts(true)
+  vm, _     := mem.VirtualMemory()
+
+  // Disks
+  parts, _ := disk.Partitions(false)
+  var disks []DiskPartition
+  for _, p := range parts {
+    du, _ := disk.Usage(p.Mountpoint)
+    disks = append(disks, DiskPartition{
+      Mountpoint: p.Mountpoint,
+      FSType:     p.Fstype,
+      TotalBytes: du.Total,
+      UsedBytes:  du.Used,
+    })
+  }
+
+  // NICs
+  ifcs, _ := net.Interfaces()
+  var nets []NetworkInterface
+  for _, iface := range ifcs {
+    // ข้าม loopback ถ้าไม่ต้องการ
+    addrs, _ := iface.Addrs()
+    var ips []string
+    for _, a := range addrs {
+      ips = append(ips, a.String())
+    }
+    nets = append(nets, NetworkInterface{
+      Name:        iface.Name,
+      MACAddress:  iface.HardwareAddr.String(),
+      IPAddresses: ips,
+    })
+  }
+
+  return Spec{
+    CPUModel: cpuInfo[0].ModelName,
+    CPUCores: cores,
+    RAMTotal: vm.Total,
+    Disks:    disks,
+    Networks: nets,
+  }
+}
+```
+
+### 4.2 ส่งข้อมูล
+
+```go
+func sendSpec(serverURL, token string, spec Spec) error {
+  body, _ := json.Marshal(spec)
+  req, _  := http.NewRequest("POST", serverURL+"/api/v1/specs",
+                             bytes.NewBuffer(body))
+  req.Header.Set("Content-Type", "application/json")
+  req.Header.Set("Authorization", "Bearer "+token)
+  resp, err := http.DefaultClient.Do(req)
+  if err != nil {
+    return err
+  }
+  defer resp.Body.Close()
+  if resp.StatusCode != http.StatusCreated {
+    return fmt.Errorf("server: %s", resp.Status)
+  }
+  return nil
+}
+```
+
+---
+
+## 5. สรุป
+
+1. **Schema**: เพิ่มตาราง `disk_partitions` กับ `network_interfaces`
+2. **API**: รับ JSON array `disks` และ `networks`
+3. **Server**:
+
+   * ขยาย `SpecInput`
+   * เพิ่ม logic บันทึก partitions & interfaces
+4. **Agent**:
+
+   * รวบรวมข้อมูลหลายดิสก์และหลาย NIC
+   * ส่ง array รูปแบบ JSON
+
+ด้วยโครงสร้างนี้ คุณจะเก็บสเปคได้ละเอียด พร้อมขยายเก็บ field อื่นๆ ในอนาคต (เช่น I/O, GPU ฯลฯ) ได้ง่ายขึ้นครับ!
+
